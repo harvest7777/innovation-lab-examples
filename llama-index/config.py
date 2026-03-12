@@ -41,7 +41,7 @@ agent = Agent(
     seed=AGENT_SEED,
     port=int(os.getenv("AGENT_PORT", "8000")),
     mailbox=True,
-    network="testnet",
+    network="testnet" if FET_USE_TESTNET else "mainnet",
 )
 
 chat_proto = Protocol(spec=chat_protocol_spec)

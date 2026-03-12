@@ -1,14 +1,19 @@
 import os
 import re
 import hashlib
+import socket
+import ipaddress
 import tempfile
+from urllib.parse import urlparse
+
 import requests
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from llama_index.core import SimpleDirectoryReader, VectorStoreIndex
 from llama_index.core.ingestion import IngestionPipeline
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.memory import ChatMemoryBuffer
-from llama_index.core.agent import ReActAgent
+from llama_index.core.agent.workflow import ReActAgent
 from llama_index.core.agent.workflow.workflow_events import ToolCallResult
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
 from llama_index.vector_stores.qdrant import QdrantVectorStore
@@ -20,11 +25,48 @@ from config import (
 
 URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
+MAX_REDIRECTS = 5
+MAX_FILENAME_LEN = 128
+
 _user_sessions: dict[str, dict] = {}
 
 
 def _collection_name(sender: str) -> str:
-    return f"user_{hashlib.md5(sender.encode()).hexdigest()[:12]}"
+    return f"user_{hashlib.sha256(sender.encode()).hexdigest()[:32]}"
+
+
+# ── SSRF protection ───────────────────────────────────────────────────
+
+def _validate_url(url: str) -> str:
+    """Validate URL scheme and resolve hostname to reject private/loopback IPs."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported URL scheme: {parsed.scheme}")
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("URL has no hostname")
+
+    # Resolve hostname and check all resulting IPs
+    try:
+        addr_infos = socket.getaddrinfo(hostname, parsed.port or 443, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise ValueError(f"Cannot resolve hostname '{hostname}': {e}") from e
+
+    for family, _, _, _, sockaddr in addr_infos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            raise ValueError(f"URL resolves to non-public address: {ip}")
+
+    return url
+
+
+def _sanitize_filename(fname: str) -> str:
+    """Strip directory components and unsafe characters from a filename."""
+    fname = os.path.basename(fname)
+    fname = re.sub(r"[^A-Za-z0-9._-]", "_", fname).strip("._")
+    fname = fname[:MAX_FILENAME_LEN]
+    return fname or "document"
 
 
 # ── Document download ─────────────────────────────────────────────────
@@ -33,7 +75,27 @@ def download_document(url: str) -> str:
     """Download a document URL to a temp directory. Returns the local file path."""
     tmp_dir = tempfile.mkdtemp(prefix="rag_")
 
-    resp = requests.get(url, timeout=120, allow_redirects=True)
+    # Validate initial URL
+    _validate_url(url)
+
+    # Manual redirect following with validation at each hop
+    current_url = url
+    resp = None
+    for _ in range(MAX_REDIRECTS):
+        resp = requests.get(current_url, timeout=120, allow_redirects=False)
+
+        if resp.is_redirect or resp.is_permanent_redirect:
+            redirect_url = resp.headers.get("Location")
+            if not redirect_url:
+                break
+            _validate_url(redirect_url)
+            current_url = redirect_url
+            continue
+
+        break
+
+    if resp is None:
+        raise RuntimeError("No response received")
     resp.raise_for_status()
 
     cd = resp.headers.get("Content-Disposition", "")
@@ -41,6 +103,8 @@ def download_document(url: str) -> str:
         fname = cd.split("filename=")[-1].strip('" ')
     else:
         fname = url.split("/")[-1].split("?")[0] or "document"
+
+    fname = _sanitize_filename(fname)
 
     if "." not in fname:
         ct = resp.headers.get("Content-Type", "")
@@ -61,16 +125,27 @@ def download_document(url: str) -> str:
 
 # ── Ingestion ─────────────────────────────────────────────────────────
 
+def _is_collection_not_found(exc: Exception) -> bool:
+    """Check if an exception indicates a missing Qdrant collection."""
+    if isinstance(exc, UnexpectedResponse) and exc.status_code == 404:
+        return True
+    if isinstance(exc, ValueError) and "not found" in str(exc).lower():
+        return True
+    return False
+
+
 def clear_collection(collection_name: str):
     """Delete a Qdrant collection if it exists, so the next ingestion starts fresh."""
     try:
         qclient.delete_collection(collection_name)
         print(f"[qdrant] Deleted collection '{collection_name}'")
-    except Exception:
-        pass
+    except Exception as e:
+        if _is_collection_not_found(e):
+            return  # Collection didn't exist — that's fine
+        raise
 
 
-def ingest_document(file_path: str, collection_name: str) -> int:
+def ingest_document(file_path: str, collection_name: str, *, cleanup: bool = False) -> int:
     """Ingest a local file into a Qdrant collection. Wipes old data first. Returns chunk count."""
     clear_collection(collection_name)
 
@@ -90,11 +165,12 @@ def ingest_document(file_path: str, collection_name: str) -> int:
     nodes = pipeline.run(documents=documents)
     print(f"[ingest] Stored {len(nodes)} chunks in '{collection_name}'")
 
-    try:
-        os.remove(file_path)
-        os.rmdir(os.path.dirname(file_path))
-    except OSError:
-        pass
+    if cleanup:
+        try:
+            os.remove(file_path)
+            os.rmdir(os.path.dirname(file_path))
+        except OSError:
+            pass
 
     return len(nodes)
 
@@ -253,6 +329,8 @@ def reset_user_session(sender: str):
 def collection_has_points(collection_name: str) -> bool:
     try:
         info = qclient.get_collection(collection_name)
-        return info.points_count > 0
-    except Exception:
-        return False
+        return info.points_count is not None and info.points_count > 0
+    except Exception as e:
+        if _is_collection_not_found(e):
+            return False
+        raise

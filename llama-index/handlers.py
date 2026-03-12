@@ -30,6 +30,7 @@ from rag import (
 )
 from payment import (
     verify_fet_payment_to_agent,
+    validate_and_consume_session,
     request_payment_from_user,
     get_agent_wallet,
 )
@@ -55,10 +56,9 @@ async def run_pending_ingestion(ctx: Context, sender: str):
         await reply(ctx, sender, "Payment received, but no pending document URL found.")
         return
 
-    ctx.storage.remove(f"pending_url:{sender}")
-
     match = URL_PATTERN.search(pending_text)
     if not match:
+        ctx.storage.remove(f"pending_url:{sender}")
         await reply(ctx, sender, "Could not find a valid URL in your message. Please resend.")
         return
 
@@ -69,7 +69,10 @@ async def run_pending_ingestion(ctx: Context, sender: str):
         await reply(ctx, sender, f"Payment verified! Downloading and ingesting your document...\n\nURL: {url}")
 
         file_path = await asyncio.to_thread(download_document, url)
-        num_chunks = await asyncio.to_thread(ingest_document, file_path, collection)
+        num_chunks = await asyncio.to_thread(ingest_document, file_path, collection, cleanup=True)
+
+        # Only remove pending URL after successful ingestion
+        ctx.storage.remove(f"pending_url:{sender}")
 
         reset_user_session(sender)
 
@@ -86,7 +89,11 @@ async def run_pending_ingestion(ctx: Context, sender: str):
     except Exception as e:
         ctx.logger.error(f"Ingestion failed for {sender[:20]}...: {e}")
         traceback.print_exc()
-        await reply(ctx, sender, f"Document ingestion failed: {e}\n\nPlease try again with a different URL.")
+        await reply(
+            ctx, sender,
+            f"Document ingestion failed: {e}\n\n"
+            f"Your payment has been recorded. Send the same URL again to retry without paying.",
+        )
 
 
 # ── Payment protocol handlers ────────────────────────────────────────
@@ -94,6 +101,20 @@ async def run_pending_ingestion(ctx: Context, sender: str):
 @payment_proto.on_message(CommitPayment)
 async def handle_commit_payment(ctx: Context, sender: str, msg: CommitPayment):
     ctx.logger.info(f"CommitPayment from {sender[:20]}... tx={msg.transaction_id}")
+
+    # Validate payment session reference
+    stored_ref = ctx.storage.get(f"payment_ref:{sender}")
+    if stored_ref and not validate_and_consume_session(stored_ref, msg.transaction_id):
+        ctx.logger.warning(f"Invalid or already-consumed payment session for {sender[:20]}...")
+        await ctx.send(
+            sender,
+            CancelPayment(
+                transaction_id=msg.transaction_id,
+                reason="Payment session invalid or already used.",
+            ),
+        )
+        await reply(ctx, sender, "Payment session expired or already used. Please send the URL again.")
+        return
 
     payment_verified = False
 
@@ -103,7 +124,9 @@ async def handle_commit_payment(ctx: Context, sender: str, msg: CommitPayment):
             buyer_wallet = msg.metadata.get("buyer_fet_wallet") or msg.metadata.get("buyer_fet_address")
 
         if buyer_wallet:
-            payment_verified = verify_fet_payment_to_agent(
+            # Offload blocking ledger RPC to a thread
+            payment_verified = await asyncio.to_thread(
+                verify_fet_payment_to_agent,
                 transaction_id=msg.transaction_id,
                 expected_amount_fet=ANALYSIS_FEE,
                 sender_fet_address=buyer_wallet,
